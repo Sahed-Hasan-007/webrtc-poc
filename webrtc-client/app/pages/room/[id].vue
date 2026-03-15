@@ -1,30 +1,4 @@
 <script setup lang="ts">
-/**
- * pages/room/[id].vue  –  Video Call Room
- *
- * What this page does
- * ────────────────────
- * 1. Reads the room ID from the URL parameter.
- * 2. Calls `joinRoom()` from the useWebRTC composable on mount, which:
- *      a) Requests camera + mic access.
- *      b) Registers socket listeners for WebRTC signaling.
- *      c) Emits 'join-room' to the signaling server.
- * 3. Watches the reactive localStream / remoteStream refs and assigns them
- *    as srcObject on <video> elements (Vue can't bind srcObject in templates).
- * 4. Exposes controls: mute, toggle video, hang up.
- * 5. Cleans up on unmount (closes RTCPeerConnection, stops tracks, removes
- *    socket listeners).
- *
- * Connection states
- * ─────────────────
- *  idle        → before getUserMedia
- *  waiting     → in room, no second peer yet
- *  connecting  → ICE in progress
- *  connected   → media flowing
- *  failed      → ICE failed (usually a STUN/TURN issue)
- *  disconnected / closed
- */
-
 const route = useRoute()
 const roomId = (route.params.id as string).toUpperCase()
 
@@ -43,20 +17,40 @@ const {
   toggleVideo
 } = useWebRTC(roomId)
 
-// Template refs for the two <video> elements
+// ── Pre-join screen ─────────────────────────────────────────────────────────
+// Show before entering the room so user picks their media mode.
+// 'camera'  → camera + mic
+// 'audio'   → mic only (no camera required)
+type MediaMode = 'camera' | 'audio'
+
+const joined = ref(false)
+const joining = ref(false)
+
+async function enter(mode: MediaMode) {
+  joining.value = true
+  await joinRoom(mode === 'camera')
+  joined.value = true
+  joining.value = false
+
+  // After stream is ready, assign immediately (watch may miss the first set)
+  await nextTick()
+  if (localVideoEl.value && localStream.value) {
+    localVideoEl.value.srcObject = localStream.value
+  }
+}
+
+// ── Video element refs ───────────────────────────────────────────────────────
 const localVideoEl = ref<HTMLVideoElement | null>(null)
 const remoteVideoEl = ref<HTMLVideoElement | null>(null)
 
-// srcObject cannot be set via :src binding — watch and assign manually
 watch(localStream, (stream) => {
   if (localVideoEl.value) localVideoEl.value.srcObject = stream
 })
-
 watch(remoteStream, (stream) => {
   if (remoteVideoEl.value) remoteVideoEl.value.srcObject = stream
 })
 
-// Derived UI helpers
+// ── Derived UI ───────────────────────────────────────────────────────────────
 const statusLabel = computed(() => {
   switch (connectionState.value) {
     case 'idle':         return 'Starting…'
@@ -76,7 +70,6 @@ const statusColor = computed(() => {
   return '#f59e0b'
 })
 
-// Copied-to-clipboard feedback
 const copied = ref(false)
 async function copyRoomId() {
   await navigator.clipboard.writeText(roomId)
@@ -89,18 +82,8 @@ function handleHangup() {
   navigateTo('/')
 }
 
-// Socket ID for display
-const myId = ref('')
-onMounted(async () => {
-  myId.value = $socket.id ?? ''
-  $socket.on('connect', () => { myId.value = $socket.id ?? '' })
-
-  await joinRoom()
-
-  // After stream is ready, assign immediately (watch may miss the first set)
-  if (localVideoEl.value && localStream.value) {
-    localVideoEl.value.srcObject = localStream.value
-  }
+onMounted(() => {
+  $socket.on('connect', () => {})
 })
 
 onBeforeUnmount(() => {
@@ -110,86 +93,122 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="room">
-    <!-- ── Header ─────────────────────────────────────────── -->
-    <header class="header">
-      <button class="back-btn" @click="navigateTo('/')">← Back</button>
 
-      <div class="room-id" @click="copyRoomId" title="Click to copy Room ID">
-        Room: <strong>{{ roomId }}</strong>
-        <span class="copy-hint">{{ copied ? '✓ Copied!' : '📋 Copy' }}</span>
+    <!-- ══════════════════════════════════════════════════════
+         PRE-JOIN SCREEN  — pick camera+mic or mic only
+         ══════════════════════════════════════════════════════ -->
+    <div v-if="!joined" class="prejoin-overlay">
+      <div class="prejoin-card">
+        <div class="prejoin-icon">📞</div>
+        <h2>Join Room <span class="room-tag">{{ roomId }}</span></h2>
+        <p class="prejoin-sub">Choose how you want to join</p>
+
+        <div class="mode-grid">
+          <!-- Camera + Mic -->
+          <button class="mode-btn" :disabled="joining" @click="enter('camera')">
+            <span class="mode-icon">📹</span>
+            <strong>Camera &amp; Mic</strong>
+            <small>Video + audio call</small>
+          </button>
+
+          <!-- Audio only -->
+          <button class="mode-btn" :disabled="joining" @click="enter('audio')">
+            <span class="mode-icon">🎤</span>
+            <strong>Mic Only</strong>
+            <small>No camera required</small>
+          </button>
+        </div>
+
+        <p v-if="joining" class="joining-msg">Requesting access…</p>
+
+        <button class="cancel-link" @click="navigateTo('/')">← Back to lobby</button>
       </div>
-
-      <div class="status">
-        <span class="status-dot" :style="{ background: statusColor }" />
-        {{ statusLabel }}
-      </div>
-    </header>
-
-    <!-- ── Error banner ───────────────────────────────────── -->
-    <div v-if="errorMessage" class="error-banner">
-      ⚠️ {{ errorMessage }}
     </div>
 
-    <!-- ── Video grid ──────────────────────────────────────── -->
-    <main class="video-grid" :class="{ 'has-remote': !!remoteStream }">
-      <!-- Remote (large) -->
-      <div class="video-tile remote-tile">
-        <video
-          ref="remoteVideoEl"
-          autoplay
-          playsinline
-          class="video-el"
-        />
-        <div v-if="!remoteStream" class="video-placeholder">
-          <span>{{ connectionState === 'waiting' ? '⏳ Waiting for peer…' : '👤 No remote video' }}</span>
+    <!-- ══════════════════════════════════════════════════════
+         CALL SCREEN
+         ══════════════════════════════════════════════════════ -->
+    <template v-else>
+
+      <!-- ── Header ──────────────────────────────────────── -->
+      <header class="header">
+        <button class="back-btn" @click="navigateTo('/')">← Back</button>
+
+        <div class="room-id" @click="copyRoomId" title="Click to copy Room ID">
+          Room: <strong>{{ roomId }}</strong>
+          <span class="copy-hint">{{ copied ? '✓ Copied!' : '📋 Copy' }}</span>
         </div>
-        <span class="tile-label">Remote</span>
+
+        <div class="status">
+          <span class="status-dot" :style="{ background: statusColor }" />
+          {{ statusLabel }}
+        </div>
+      </header>
+
+      <!-- ── Info / warning banner ────────────────────────── -->
+      <div v-if="errorMessage" class="info-banner">
+        ⚠️ {{ errorMessage }}
       </div>
 
-      <!-- Local (small picture-in-picture style) -->
-      <div class="video-tile local-tile">
-        <video
-          ref="localVideoEl"
-          autoplay
-          muted
-          playsinline
-          class="video-el"
-          :class="{ 'video-off': isVideoOff }"
-        />
-        <div v-if="isVideoOff" class="video-placeholder small">
-          <span>📷 Camera off</span>
+      <!-- ── Video grid ─────────────────────────────────── -->
+      <main class="video-grid" :class="{ 'has-remote': !!remoteStream }">
+
+        <!-- Remote (large) -->
+        <div class="video-tile remote-tile">
+          <video ref="remoteVideoEl" autoplay playsinline class="video-el" />
+          <div v-if="!remoteStream" class="video-placeholder">
+            <span>{{ connectionState === 'waiting' ? '⏳ Waiting for peer…' : '👤 No remote video' }}</span>
+          </div>
+          <span class="tile-label">Remote</span>
         </div>
-        <span class="tile-label">You</span>
-      </div>
-    </main>
 
-    <!-- ── Controls ────────────────────────────────────────── -->
-    <footer class="controls">
-      <button
-        class="ctrl-btn"
-        :class="{ active: isMuted }"
-        @click="toggleMute"
-        :title="isMuted ? 'Unmute' : 'Mute'"
-      >
-        {{ isMuted ? '🔇' : '🎤' }}
-        <span>{{ isMuted ? 'Unmute' : 'Mute' }}</span>
-      </button>
+        <!-- Local (PiP) -->
+        <div class="video-tile local-tile">
+          <video
+            ref="localVideoEl"
+            autoplay muted playsinline
+            class="video-el"
+            :class="{ 'video-off': isVideoOff }"
+          />
+          <div v-if="isVideoOff || !localStream" class="video-placeholder small">
+            <span>{{ localStream ? '📷 Camera off' : '🎤 Audio only' }}</span>
+          </div>
+          <span class="tile-label">You</span>
+        </div>
 
-      <button
-        class="ctrl-btn"
-        :class="{ active: isVideoOff }"
-        @click="toggleVideo"
-        :title="isVideoOff ? 'Turn on camera' : 'Turn off camera'"
-      >
-        {{ isVideoOff ? '📷' : '📹' }}
-        <span>{{ isVideoOff ? 'Start Video' : 'Stop Video' }}</span>
-      </button>
+      </main>
 
-      <button class="ctrl-btn hangup" @click="handleHangup" title="Leave call">
-        📵
-        <span>Leave</span>
-      </button>
-    </footer>
+      <!-- ── Controls ────────────────────────────────────── -->
+      <footer class="controls">
+        <button
+          class="ctrl-btn"
+          :class="{ active: isMuted }"
+          @click="toggleMute"
+          :disabled="!localStream"
+          :title="isMuted ? 'Unmute' : 'Mute'"
+        >
+          {{ isMuted ? '🔇' : '🎤' }}
+          <span>{{ isMuted ? 'Unmute' : 'Mute' }}</span>
+        </button>
+
+        <button
+          class="ctrl-btn"
+          :class="{ active: isVideoOff }"
+          @click="toggleVideo"
+          :disabled="!localStream"
+          :title="isVideoOff ? 'Turn on camera' : 'Turn off camera'"
+        >
+          {{ isVideoOff ? '📷' : '📹' }}
+          <span>{{ isVideoOff ? 'Start Video' : 'Stop Video' }}</span>
+        </button>
+
+        <button class="ctrl-btn hangup" @click="handleHangup" title="Leave call">
+          📵
+          <span>Leave</span>
+        </button>
+      </footer>
+
+    </template>
   </div>
 </template>
 
@@ -201,7 +220,118 @@ onBeforeUnmount(() => {
   background: #0a0a0a;
 }
 
-/* ── Header ─────────────────────────────────────────────── */
+/* ══ Pre-join overlay ═══════════════════════════════════════ */
+.prejoin-overlay {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.prejoin-card {
+  background: #1a1a1a;
+  border: 1px solid #2e2e2e;
+  border-radius: 1rem;
+  padding: 2.5rem 2rem;
+  width: 100%;
+  max-width: 420px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+}
+
+.prejoin-icon {
+  font-size: 2.5rem;
+}
+
+.prejoin-card h2 {
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+.room-tag {
+  display: inline-block;
+  background: #2e2e2e;
+  border-radius: 0.375rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 1rem;
+  letter-spacing: 0.08em;
+  color: #e5e5e5;
+  margin-left: 0.25rem;
+}
+
+.prejoin-sub {
+  font-size: 0.875rem;
+  color: #777;
+  margin-top: -0.5rem;
+}
+
+.mode-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.mode-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  background: #111;
+  border: 2px solid #2e2e2e;
+  border-radius: 0.75rem;
+  color: #e5e5e5;
+  cursor: pointer;
+  padding: 1.25rem 0.75rem;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.mode-btn:hover:not(:disabled) {
+  border-color: #3b82f6;
+  background: #0f1e3a;
+}
+
+.mode-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mode-icon {
+  font-size: 2rem;
+}
+
+.mode-btn strong {
+  font-size: 0.9rem;
+}
+
+.mode-btn small {
+  font-size: 0.72rem;
+  color: #666;
+}
+
+.joining-msg {
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.cancel-link {
+  background: none;
+  border: none;
+  color: #555;
+  font-size: 0.8rem;
+  cursor: pointer;
+  margin-top: -0.25rem;
+}
+
+.cancel-link:hover {
+  color: #aaa;
+}
+
+/* ══ Header ═════════════════════════════════════════════════ */
 .header {
   display: flex;
   align-items: center;
@@ -224,9 +354,7 @@ onBeforeUnmount(() => {
   transition: color 0.15s;
 }
 
-.back-btn:hover {
-  color: #e5e5e5;
-}
+.back-btn:hover { color: #e5e5e5; }
 
 .room-id {
   display: flex;
@@ -241,19 +369,9 @@ onBeforeUnmount(() => {
   transition: background 0.15s;
 }
 
-.room-id:hover {
-  background: #1e1e1e;
-}
-
-.room-id strong {
-  color: #e5e5e5;
-  letter-spacing: 0.08em;
-}
-
-.copy-hint {
-  font-size: 0.75rem;
-  color: #555;
-}
+.room-id:hover { background: #1e1e1e; }
+.room-id strong { color: #e5e5e5; letter-spacing: 0.08em; }
+.copy-hint { font-size: 0.75rem; color: #555; }
 
 .status {
   display: flex;
@@ -270,30 +388,25 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 
-/* ── Error ──────────────────────────────────────────────── */
-.error-banner {
-  background: #7f1d1d;
-  color: #fca5a5;
-  padding: 0.6rem 1.25rem;
-  font-size: 0.875rem;
+/* ══ Info banner ════════════════════════════════════════════ */
+.info-banner {
+  background: #1c1a08;
+  color: #fde68a;
+  padding: 0.5rem 1.25rem;
+  font-size: 0.825rem;
   text-align: center;
+  border-bottom: 1px solid #3a3000;
 }
 
-/* ── Video grid ─────────────────────────────────────────── */
+/* ══ Video grid ═════════════════════════════════════════════ */
 .video-grid {
   flex: 1;
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: 1fr;
-  gap: 0.5rem;
   padding: 0.5rem;
   position: relative;
   overflow: hidden;
-}
-
-/* When both streams are present, lay out side by side */
-.video-grid.has-remote {
-  grid-template-columns: 1fr;
 }
 
 .video-tile {
@@ -306,7 +419,6 @@ onBeforeUnmount(() => {
   justify-content: center;
 }
 
-/* Local video: small PiP in the corner */
 .local-tile {
   position: absolute;
   bottom: 1rem;
@@ -319,7 +431,6 @@ onBeforeUnmount(() => {
   background: #0f0f0f;
 }
 
-/* When no remote video, make local tile full-size */
 .video-grid:not(.has-remote) .local-tile {
   position: relative;
   bottom: auto;
@@ -329,21 +440,10 @@ onBeforeUnmount(() => {
   border: none;
 }
 
-.remote-tile {
-  width: 100%;
-  height: 100%;
-}
+.remote-tile { width: 100%; height: 100%; }
 
-.video-el {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.video-off {
-  visibility: hidden;
-}
+.video-el { width: 100%; height: 100%; object-fit: cover; display: block; }
+.video-off { visibility: hidden; }
 
 .video-placeholder {
   position: absolute;
@@ -356,9 +456,7 @@ onBeforeUnmount(() => {
   background: #111;
 }
 
-.video-placeholder.small {
-  font-size: 0.75rem;
-}
+.video-placeholder.small { font-size: 0.75rem; }
 
 .tile-label {
   position: absolute;
@@ -371,7 +469,7 @@ onBeforeUnmount(() => {
   border-radius: 0.25rem;
 }
 
-/* ── Controls ─────────────────────────────────────────────── */
+/* ══ Controls ═══════════════════════════════════════════════ */
 .controls {
   display: flex;
   align-items: center;
@@ -398,34 +496,14 @@ onBeforeUnmount(() => {
   transition: background 0.15s;
 }
 
-.ctrl-btn span {
-  font-size: 0.65rem;
-  color: #888;
-}
+.ctrl-btn span { font-size: 0.65rem; color: #888; }
+.ctrl-btn:hover:not(:disabled) { background: #2a2a2a; }
+.ctrl-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
-.ctrl-btn:hover {
-  background: #2a2a2a;
-}
+.ctrl-btn.active { background: #2e1a1a; color: #f87171; }
+.ctrl-btn.active span { color: #f87171; }
 
-.ctrl-btn.active {
-  background: #2e1a1a;
-  color: #f87171;
-}
-
-.ctrl-btn.active span {
-  color: #f87171;
-}
-
-.ctrl-btn.hangup {
-  background: #7f1d1d;
-  color: #fca5a5;
-}
-
-.ctrl-btn.hangup:hover {
-  background: #991b1b;
-}
-
-.ctrl-btn.hangup span {
-  color: #fca5a5;
-}
+.ctrl-btn.hangup { background: #7f1d1d; color: #fca5a5; }
+.ctrl-btn.hangup:hover { background: #991b1b; }
+.ctrl-btn.hangup span { color: #fca5a5; }
 </style>

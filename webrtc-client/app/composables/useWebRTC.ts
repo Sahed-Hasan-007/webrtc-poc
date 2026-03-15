@@ -54,16 +54,36 @@ export function useWebRTC(roomId: string) {
 
   // ─── Media ────────────────────────────────────────────────────────────────
 
-  async function initLocalStream() {
+  // withVideo=false → audio-only (no camera required)
+  async function initLocalStream(withVideo = true) {
+    // Try the requested constraints first
+    const constraints: MediaStreamConstraints = {
+      audio: true,
+      video: withVideo ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false
+    }
+
     try {
-      localStream.value = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: true
-      })
-    } catch (err) {
-      errorMessage.value =
-        'Camera/microphone access denied. Please allow permissions and reload.'
-      throw err
+      localStream.value = await navigator.mediaDevices.getUserMedia(constraints)
+    } catch {
+      if (withVideo) {
+        // Camera denied or unavailable — silently fall back to audio-only
+        try {
+          localStream.value = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: false
+          })
+          isVideoOff.value = true
+          errorMessage.value = 'Camera not available — joined with audio only.'
+        } catch {
+          // No media devices at all — proceed without any stream
+          localStream.value = null
+          errorMessage.value = 'No media devices found — joining without audio/video.'
+        }
+      } else {
+        // Audio-only was explicitly requested and still failed
+        localStream.value = null
+        errorMessage.value = 'Microphone access denied — joining without audio.'
+      }
     }
   }
 
@@ -167,8 +187,8 @@ export function useWebRTC(roomId: string) {
 
   // ─── Room lifecycle ───────────────────────────────────────────────────────
 
-  async function joinRoom() {
-    await initLocalStream()
+  async function joinRoom(withVideo = true) {
+    await initLocalStream(withVideo)
 
     $socket.emit('join-room', roomId)
 
